@@ -57,7 +57,7 @@
     DISPLAYSERVER="wl"
 
   # Windowmanager to use (weston / swaywm-env / no)
-    WINDOWMANAGER="weston11"
+    WINDOWMANAGER="weston"
   
   # build and install rocknix joypad driver (yes / no)
     ROCKNIX_JOYPAD="yes"
@@ -76,5 +76,8 @@
   # e.g. ADDITIONAL_DRIVERS="DRIVER1 DRIVER2"
     ADDITIONAL_DRIVERS="RTW88 RTL8851BU mali-bifrost"
  
+  # additional packages to install
+    ADDITIONAL_PACKAGES="weston-kiosk-shell-dpms"
+
   # debug tty path
     DEBUG_TTY="/dev/ttyAML0"
