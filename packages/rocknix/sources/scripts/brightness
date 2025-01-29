@@ -40,8 +40,8 @@ stepUp() {
 stepDown() {
   CURRENT="$(get_setting display.brightness)"
   NEXT="$((${CURRENT}-5))"
-  if (("${NEXT}" <= "5")); then
-    NEXT="5"
+  if (("${NEXT}" <= "0")); then
+    NEXT="0"
   fi
 
   BRIGHTNESS="${NEXT}"

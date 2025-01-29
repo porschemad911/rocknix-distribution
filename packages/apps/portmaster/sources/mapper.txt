@@ -149,5 +149,8 @@ while IFS=";" read -r NAME GUID; do
     fi
 done <<< ${ES_QUERY:1}
 
+# TODO - Call function to create controller db
+#create_controller_db
+
 #Reset file for next run
 sed -i '/^ACTIVE_GAME=/c\ACTIVE_GAME=""' /storage/.config/PortMaster/mapper.txt
