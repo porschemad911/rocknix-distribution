@@ -1,0 +1,9 @@
+[Unit]
+Description=Log battery statistics
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rocknix-battery-log
+
+[Install]
+WantedBy=multi-user.target

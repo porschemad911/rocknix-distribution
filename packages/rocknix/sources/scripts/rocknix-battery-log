@@ -1,0 +1,20 @@
+#!/bin/sh
+# This script logs battery charging stats.
+
+. /etc/profile
+
+BATTERY_DEVICE=/sys/class/power_supply/battery
+LOG_FILE=/var/log/rocknix-battery.log
+
+echo "STATUS,CHARGE_TYPE,CURRENT_NOW,VOLTAGE_NOW,CAPACITY" > "${LOG_FILE}"
+
+while true
+do
+        STATUS=$(cat "${BATTERY_DEVICE}/status")
+        CHARGE_TYPE=$(cat "${BATTERY_DEVICE}/charge_type")
+        CURRENT_NOW=$(cat "${BATTERY_DEVICE}/current_now")
+        VOLTAGE_NOW=$(cat "${BATTERY_DEVICE}/voltage_now")
+        CAPACITY=$(cat "${BATTERY_DEVICE}/capacity")
+        echo "${STATUS},${CHARGE_TYPE},${CURRENT_NOW},${VOLTAGE_NOW},${CAPACITY}" >> "${LOG_FILE}"
+        sleep 2
+done
