@@ -128,6 +128,11 @@ pre_make_target() {
     ${PKG_BUILD}/scripts/config --disable CONFIG_SWAP
   fi
 
+  # disable zram support if zram swap not enabled
+  if [ ! "${SWAP_TYPE}" = zram ]; then
+    ${PKG_BUILD}/scripts/config --disable CONFIG_ZRAM
+  fi
+
   # disable nfs support if not enabled
   if [ "${NFS_SUPPORT}" = no ]; then
     ${PKG_BUILD}/scripts/config --disable CONFIG_NFS_FS
