@@ -6,11 +6,11 @@
 
 ### Enable logging
 case $(get_setting system.loglevel) in
-  verbose)
-    DEBUG=true
+verbose)
+  DEBUG=true
   ;;
-  *)
-    DEBUG=false
+*)
+  DEBUG=false
   ;;
 esac
 
@@ -18,27 +18,78 @@ SUSPEND_MODE="$(get_setting system.suspendmode)"
 
 # Only do something when suspend mode is off
 if [ "${SUSPEND_MODE}" != "off" ]; then
-    ${DEBUG} && log $0 "Suspend enabled, exiting"
-    exit 0
+  ${DEBUG} && log $0 "Suspend enabled, exiting"
+  exit 0
 fi
+
+SHUTDOWN_DELAY="$(get_setting system.shutdown_delay)"
+if [ "${SHUTDOWN_DELAY}" = "" ]; then
+    SHUTDOWN_DELAY=10
+fi
+
+SHUTDOWN_DELAY_RUNNING_GAME="$(get_setting system.shutdown_delay_running_game)"
+if [ "${SHUTDOWN_DELAY_RUNNING_GAME}" = "" ]; then
+    SHUTDOWN_DELAY_RUNNING_GAME=60
+fi
+
+# flag file
+PID=$$
+FLAG_FILE_PATTERN="/var/run/lid-close-shutdown-delay.flag"
+FLAG_FILE="${FLAG_FILE_PATTERN}.${PID}"
+
+# Process to kill
+TO_KILL="rocknix-lid"
 
 # Action = open / close
 ACTION=$1
 
-do_es_shutdown() {
-    # Shutdown only when ES is up and no game is running
-    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:1234/runningGame")
-    test $? != 0                 && return 0
-    test "${HTTP_STATUS}" != 201 && return 0 # 201 when not game
-
-    ${DEBUG} && log $0 "Shutting down"
-
-    curl "http://localhost:1234/shutdown"
+check_es_running_game() {
+  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:1234/runningGame")
+  ${DEBUG} && log $0 "ES runningGame HTTP_STATUS - ${HTTP_STATUS}"
+  test $? != 0 && return 1 # call failed, assume no game running
+  test "${HTTP_STATUS}" = 201 && return 1 # 201 when no game running
+  test "${HTTP_STATUS}" = 200 && return 0 # 200 when game running
 }
 
-# Only need to act on close
+do_es_shutdown() {
+  # Shutdown only when ES is up and no game is running
+  ${DEBUG} && log $0 "Shutting down"
+
+  curl "http://localhost:1234/shutdown"
+}
+
 if [ "${ACTION}" = "close" ]; then
-    ${DEBUG} && log $0 "Lid close"
+  # Lid close event - create flag file
+  ${DEBUG} && log $0 "Lid close - creating ${FLAG_FILE}"
+  touch "${FLAG_FILE}"
+
+  # Wait for the desired shutdown delay
+  check_es_running_game
+  RUNNING_GAME=$?
+
+  if [[ $RUNNING_GAME -eq 0 ]]; then
+    ${DEBUG} && log $0 "Game running, shutdown delay ${SHUTDOWN_DELAY_RUNNING_GAME}"
+    sleep ${SHUTDOWN_DELAY_RUNNING_GAME}
+  else
+    ${DEBUG} && log $0 "No game running, shutdown delay ${SHUTDOWN_DELAY}"
+    sleep ${SHUTDOWN_DELAY}
+  fi
+
+  # Check whether the flag file is still present
+  if [ -f "${FLAG_FILE}" ]; then
+    ${DEBUG} && log $0 "Delay expired, flag file found, shutting down"
     # Use ES shutdown so metadata is saved
     do_es_shutdown
+  else
+    ${DEBUG} && log $0 "Delay expired, flag file not found"
+    exit 0
+  fi
+else
+  # Lid open event - remove the flag file and kill processes
+  ${DEBUG} && log $0 "Lid open - removing ${FLAG_FILE_PATTERN}.*"
+  rm "${FLAG_FILE_PATTERN}".*
+
+  ${DEBUG} && log $0 "Lid open - killing ${TO_KILL} processes"
+  killall ${TO_KILL}
+  exit 0
 fi
