@@ -273,11 +273,14 @@ set +e
       (${FUNCTION_VOLUME_DOWN_EVENT})
         execute_action down
       ;;
-      (${FUNCTION_POWER_RELEASED_EVENT})
-        rocknix-shutdown 0 &
-      ;;
       (${FUNCTION_POWER_PRESSED_EVENT})
-        rocknix-shutdown 1 &
+        if [[ -f "/var/run/power-lid-close-active.flag" ]]; then
+          rm /var/run/power-lid-close-active.flag
+          /usr/bin/rocknix-lid open &
+        else
+          touch /var/run/power-lid-close-active.flag
+          /usr/bin/rocknix-lid close &
+        fi
       ;;
       (${FUNCTION_LID_OPEN_EVENT})
         ${DEBUG} && log $0 "${FUNCTION_LID_OPEN_EVENT}: Open"

@@ -74,6 +74,8 @@ do_lid_close_actions() {
   if echo "${UI_SERVICE}" | grep "sway"; then
     ${DEBUG} && log $0 "Display power off"
     swaymsg "output * power off"
+  elif echo "${UI_SERVICE}" | grep "weston"; then
+    dpms-client -m off
   fi
 
   # Mute audio
@@ -94,6 +96,8 @@ do_lid_open_actions() {
   if echo "${UI_SERVICE}" | grep "sway"; then
     ${DEBUG} && log $0 "Display power on"
     swaymsg "output * power on"
+  elif echo "${UI_SERVICE}" | grep "weston"; then
+    dpms-client -m on
   fi
 
   # Unmute audio
