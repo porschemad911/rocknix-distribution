@@ -10,6 +10,12 @@ PKG_LONGDESC="hakuX libretro core"
 PKG_TOOLCHAIN="manual"
 
 case ${DEVICE} in
+  RK3566|S922X)
+    PKG_DEPENDS_TARGET+=" malisx2"
+    ;;
+esac
+
+case ${DEVICE} in
   S922X)
     PKG_VERSION="0.18.1-exp.2"
     PKG_SHA256="91bb06c090922e2e68febead60f37f45ebd02f18cd0237f7aac4db22d79ba7a4"
