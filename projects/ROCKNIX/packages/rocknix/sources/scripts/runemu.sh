@@ -257,6 +257,11 @@ case ${EMULATOR} in
       ;;
     esac
 
+    MALISX2_ICD="/usr/share/malisx2/malisx2_icd.aarch64.json"
+    if [ -e /dev/mali0 ] && [ -f "${MALISX2_ICD}" ] && [ "${CORE}" == "hakux" ]; then
+      export VK_DRIVER_FILES="${MALISX2_ICD}"
+    fi
+    ${VERBOSE} && log $0 "VK_DRIVER_FILES=${VK_DRIVER_FILES}"
 
     RUNTHIS='${EMUPERF} /usr/bin/${RABIN} -L /tmp/cores/${CORE}_libretro.so --config ${RETROARCH_TEMP_CONFIG} --appendconfig ${RETROARCH_APPEND_CONFIG} "${ROMNAME}"'
 
