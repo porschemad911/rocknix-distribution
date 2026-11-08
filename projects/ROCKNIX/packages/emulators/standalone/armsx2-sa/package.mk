@@ -2,10 +2,10 @@
 # Copyright (C) 2024-present ROCKNIX (https://github.com/ROCKNIX)
 
 PKG_NAME="armsx2-sa"
-PKG_VERSION="ce3743fa039f9aea4c53e4f2fd7d200043dc86ab"
-PKG_SHA256="3745c342a45951bdc3101a5bf70338f63ae012f24119e55bcd3d0df50cbdbf10"
+PKG_VERSION="ea9529590ec2563a814fd0892da2ab94b2115a41"
+PKG_SHA256="fb50357d6883edf68ecd8ec2568691e5975c3e5505b847bfe5905b836d47b709"
 PKG_LICENSE="GPL-3.0-or-later"
-PKG_SITE="https://github.com/ARMSX2/ARMSX2"
+PKG_SITE="https://github.com/sunshineinabox/ARMSX2/"
 PKG_URL="${PKG_SITE}/archive/${PKG_VERSION}.tar.gz"
 PKG_LONGDESC="ARMSX2 is a native ARM64 PlayStation 2 (PS2) emulator, a fork of PCSX2 that ports the EE/IOP/VU JIT recompilers to ARM64."
 PKG_DEPENDS_TARGET="toolchain llvm:host SDL3 libpng zlib libjpeg-turbo zstd lz4 libwebp freetype plutosvg curl libpcap ffmpeg libX11 libXext qt6 shaderc ecm"
