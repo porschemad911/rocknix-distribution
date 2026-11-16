@@ -1,0 +1,1621 @@
+From: Max 3 Pro device tree <max3pro@localhost>
+Subject: [PATCH] max3pro: MIPI DSI panel and backlight
+
+Drive the built-in 480x854 ST7701 panel of the ODROID-GO Ultra / RGB10
+Max 3 Pro from U-Boot, with its PWM backlight. Mainline U-Boot has the
+Synopsys DSI host, the AXG D-PHY and the Meson PWM, but not the Meson
+DSI output, so this adds:
+
+- meson_dw_mipi_dsi: the G12 DSI glue (port of the Linux driver). The
+  U-Boot clock driver doesn't model GP0/VCLK2/ENCL/DSI pxclk, so it sets
+  them in the HHI registers like the Hardkernel BSP U-Boot does: GP0 =
+  lane bit rate (integer multiplier, pixel clock rounded to match), DSI
+  bit clock = GP0, ENCL = GP0 / (bpp / lanes).
+- ENCL setup in the VPU (port of meson_venc_mipi_dsi_mode_set). The VPU
+  uses the DSI panel when the bridge is present, else HDMI/CVBS as before.
+- phy-meson-g12a-mipi-dphy-analog (port of the Linux driver), AXG D-PHY
+  allowed on G12A, MIPI DSI host/PHY clock gates.
+- sitronix-st7701: the "odroid,go-ultra-panel" init sequence and mode from
+  the Linux driver. The panel supply (vcc_lcd, RK817 LDO8) gets its fixed
+  3.3 V set before it is enabled: U-Boot only applies constraints to
+  boot-on regulators, so after a power-off the panel stayed dark at the
+  LDO's reset voltage (a reboot kept the 3.3 V Linux had set).
+- Device tree: panel, backlight (pwm_ef channel 1 = GPIOH_5, on the xtal
+  with the old PWM binding U-Boot knows), DSI and D-PHY nodes enabled. The
+  panel's rotation (270) turns the console (CONSOLE_ROTATION).
+- pwm-meson: find the xtal ("fixed_clock" driver, the PWM driver looked
+  for "fixed_rate_clock" and failed to probe, so no backlight), and two
+  inverted register masks.
+- CONSOLE_RECORD + "fastboot oem console": read the U-Boot log over USB
+  (fastboot mode: VOLUME-UP + VOLUME-DOWN), the board has no serial port.
+
+The framebuffer pipeline for the kernel is "vpu-dsi"; without such a
+simplefb node in the kernel DT it is only reserved.
+
+---
+diff --git a/arch/arm/dts/meson-g12b-odroid-go-ultra-u-boot.dtsi b/arch/arm/dts/meson-g12b-odroid-go-ultra-u-boot.dtsi
+index daffe065..b9c4016a 100644
+--- a/arch/arm/dts/meson-g12b-odroid-go-ultra-u-boot.dtsi
++++ b/arch/arm/dts/meson-g12b-odroid-go-ultra-u-boot.dtsi
+@@ -73,3 +73,54 @@
+ 		remote-endpoint = <&hdmi_connector_in>;
+ 	};
+ };
++
++/*
++ * Built-in 480x854 MIPI DSI panel (ST7701, same on the ODROID-GO Ultra and
++ * the RGB10 Max 3 Pro) and its PWM backlight, as in the kernel device tree.
++ * When enabled, the VPU uses the panel instead of HDMI.
++ */
++/ {
++	panel_backlight: backlight {
++		compatible = "pwm-backlight";
++		pwms = <&pwm_ef 1 40000 0>;
++		brightness-levels = <0 255>;
++		default-brightness-level = <255>;
++	};
++};
++
++/* U-Boot's PWM driver only knows the old binding: both channels on the xtal */
++&pwm_ef {
++	compatible = "amlogic,meson-g12a-ee-pwm";
++	clocks = <&xtal>, <&xtal>;
++	clock-names = "clkin0", "clkin1";
++	pinctrl-0 = <&pwm_f_h_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++};
++
++&mipi_analog_dphy {
++	status = "okay";
++};
++
++&mipi_dphy {
++	status = "okay";
++};
++
++/* The DSI glue sets the GP0/VCLK2/ENCL clocks itself */
++&mipi_dsi {
++	status = "okay";
++	/delete-property/ assigned-clocks;
++	/delete-property/ assigned-clock-parents;
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	panel@0 {
++		compatible = "odroid,go-ultra-panel", "sitronix,st7701";
++		reg = <0>;
++		reset-gpios = <&gpio GPIOH_4 GPIO_ACTIVE_HIGH>;
++		IOVCC-supply = <&vcc_lcd>;
++		VCC-supply = <&vcc_lcd>;
++		backlight = <&panel_backlight>;
++		rotation = <270>;
++	};
++};
+diff --git a/configs/max3pro_android_defconfig b/configs/max3pro_android_defconfig
+index 9c30bddc..1fa7567b 100644
+--- a/configs/max3pro_android_defconfig
++++ b/configs/max3pro_android_defconfig
+@@ -61,6 +61,15 @@ CONFIG_VIDEO=y
+ # CONFIG_VIDEO_BPP8 is not set
+ # CONFIG_VIDEO_BPP16 is not set
+ CONFIG_VIDEO_MESON=y
++CONFIG_VIDEO_MESON_DW_MIPI_DSI=y
++CONFIG_VIDEO_LCD_SITRONIX_ST7701=y
++CONFIG_BACKLIGHT=y
++CONFIG_BACKLIGHT_PWM=y
++CONFIG_DM_PWM=y
++CONFIG_PWM_MESON=y
++CONFIG_CONSOLE_ROTATION=y
++CONFIG_CONSOLE_RECORD=y
++CONFIG_FASTBOOT_CMD_OEM_CONSOLE=y
+ CONFIG_VIDEO_DT_SIMPLEFB=y
+ CONFIG_DEBUG_UART_ANNOUNCE=y
+ CONFIG_DEBUG_UART_SKIP_INIT=y
+diff --git a/drivers/clk/meson/g12a.c b/drivers/clk/meson/g12a.c
+index f33938e1..14b78dd6 100644
+--- a/drivers/clk/meson/g12a.c
++++ b/drivers/clk/meson/g12a.c
+@@ -110,7 +110,9 @@ static ulong meson_clk_get_rate_by_id(struct clk *clk, unsigned long id);
+ 
+ static struct meson_gate gates[NUM_CLKS] = {
+ 	/* Everything Else (EE) domain gates */
++	MESON_GATE(CLKID_MIPI_DSI_HOST, HHI_GCLK_MPEG0, 3),
+ 	MESON_GATE(CLKID_SPICC0, HHI_GCLK_MPEG0, 8),
++	MESON_GATE(CLKID_MIPI_DSI_PHY, HHI_GCLK_MPEG0, 20),
+ 	MESON_GATE(CLKID_I2C, HHI_GCLK_MPEG0, 9),
+ 	MESON_GATE(CLKID_UART0, HHI_GCLK_MPEG0, 13),
+ 	MESON_GATE(CLKID_SPICC1, HHI_GCLK_MPEG0, 14),
+diff --git a/drivers/phy/Kconfig b/drivers/phy/Kconfig
+index 89d84df9..bd631ca5 100644
+--- a/drivers/phy/Kconfig
++++ b/drivers/phy/Kconfig
+@@ -209,7 +209,7 @@ config MESON_G12A_USB_PHY
+ 
+ config MESON_AXG_MIPI_DPHY
+ 	bool "Amlogic Meson AXG MIPI D-PHY"
+-	depends on PHY && ARCH_MESON && MESON_AXG
++	depends on PHY && ARCH_MESON && (MESON_AXG || MESON_G12A)
+ 	select MIPI_DPHY_HELPERS
+ 	imply REGMAP
+ 	help
+@@ -225,6 +225,16 @@ config MESON_AXG_MIPI_PCIE_ANALOG_PHY
+ 	  This is the generic phy driver for the Amlogic Meson AXG
+ 	  MIPI PCIe Analog PHY.
+ 
++config MESON_G12A_MIPI_DPHY_ANALOG
++	bool "Amlogic Meson G12A MIPI Analog D-PHY"
++	depends on PHY && ARCH_MESON && MESON_G12A
++	select MIPI_DPHY_HELPERS
++	select REGMAP
++	select SYSCON
++	help
++	  This is the generic phy driver for the analog part of the
++	  Amlogic Meson G12A/G12B/SM1 MIPI DSI D-PHY.
++
+ config OMAP_USB2_PHY
+ 	bool "Support OMAP's USB2 PHY"
+ 	depends on PHY
+diff --git a/drivers/phy/Makefile b/drivers/phy/Makefile
+index e46c3628..233b487f 100644
+--- a/drivers/phy/Makefile
++++ b/drivers/phy/Makefile
+@@ -30,6 +30,7 @@ obj-$(CONFIG_MESON_GXL_USB_PHY) += meson-gxl-usb2.o
+ obj-$(CONFIG_MESON_G12A_USB_PHY) += meson-g12a-usb2.o meson-g12a-usb3-pcie.o
+ obj-$(CONFIG_MESON_AXG_MIPI_DPHY) += meson-axg-mipi-dphy.o
+ obj-$(CONFIG_MESON_AXG_MIPI_PCIE_ANALOG_PHY) += meson-axg-mipi-pcie-analog.o
++obj-$(CONFIG_MESON_G12A_MIPI_DPHY_ANALOG) += meson-g12a-mipi-dphy-analog.o
+ obj-$(CONFIG_OMAP_USB2_PHY) += omap-usb2-phy.o
+ obj-$(CONFIG_KEYSTONE_USB_PHY) += keystone-usb-phy.o
+ obj-$(CONFIG_MT7620_USB_PHY) += mt7620-usb-phy.o
+diff --git a/drivers/phy/meson-g12a-mipi-dphy-analog.c b/drivers/phy/meson-g12a-mipi-dphy-analog.c
+new file mode 100644
+index 00000000..1df9809c
+--- /dev/null
++++ b/drivers/phy/meson-g12a-mipi-dphy-analog.c
+@@ -0,0 +1,145 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Meson G12A MIPI DSI Analog PHY
++ *
++ * Port of the Linux phy-meson-g12a-mipi-dphy-analog driver.
++ *
++ * Copyright (C) 2018 Amlogic, Inc. All rights reserved
++ * Copyright (C) 2022 BayLibre, SAS
++ * Author: Neil Armstrong <narmstrong@baylibre.com>
++ */
++
++#include <dm.h>
++#include <errno.h>
++#include <generic-phy.h>
++#include <phy-mipi-dphy.h>
++#include <regmap.h>
++#include <syscon.h>
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/err.h>
++#include <linux/string.h>
++
++#define HHI_MIPI_CNTL0 0x00
++#define		HHI_MIPI_CNTL0_DIF_REF_CTL1	GENMASK(31, 16)
++#define		HHI_MIPI_CNTL0_DIF_REF_CTL0	GENMASK(15, 0)
++
++#define HHI_MIPI_CNTL1 0x04
++#define		HHI_MIPI_CNTL1_BANDGAP		BIT(16)
++#define		HHI_MIPI_CNTL2_DIF_REF_CTL2	GENMASK(15, 0)
++
++#define HHI_MIPI_CNTL2 0x08
++#define		HHI_MIPI_CNTL2_DIF_TX_CTL1	GENMASK(31, 16)
++#define		HHI_MIPI_CNTL2_CH_EN		GENMASK(15, 11)
++#define		HHI_MIPI_CNTL2_DIF_TX_CTL0	GENMASK(10, 0)
++
++#define DSI_LANE_0				BIT(4)
++#define DSI_LANE_1				BIT(3)
++#define DSI_LANE_CLK				BIT(2)
++#define DSI_LANE_2				BIT(1)
++#define DSI_LANE_3				BIT(0)
++
++struct phy_g12a_mipi_dphy_analog_priv {
++	struct regmap *regmap;
++	struct phy_configure_opts_mipi_dphy config;
++};
++
++static int phy_g12a_mipi_dphy_analog_configure(struct phy *phy, void *params)
++{
++	struct phy_g12a_mipi_dphy_analog_priv *priv = dev_get_priv(phy->dev);
++	struct phy_configure_opts_mipi_dphy *config = params;
++	int ret;
++
++	ret = phy_mipi_dphy_config_validate(config);
++	if (ret)
++		return ret;
++
++	memcpy(&priv->config, config, sizeof(priv->config));
++
++	return 0;
++}
++
++static int phy_g12a_mipi_dphy_analog_power_on(struct phy *phy)
++{
++	struct phy_g12a_mipi_dphy_analog_priv *priv = dev_get_priv(phy->dev);
++	unsigned int reg;
++
++	regmap_write(priv->regmap, HHI_MIPI_CNTL0,
++		     FIELD_PREP(HHI_MIPI_CNTL0_DIF_REF_CTL0, 0x8) |
++		     FIELD_PREP(HHI_MIPI_CNTL0_DIF_REF_CTL1, 0xa487));
++
++	regmap_write(priv->regmap, HHI_MIPI_CNTL1,
++		     FIELD_PREP(HHI_MIPI_CNTL2_DIF_REF_CTL2, 0x2e) |
++		     HHI_MIPI_CNTL1_BANDGAP);
++
++	regmap_write(priv->regmap, HHI_MIPI_CNTL2,
++		     FIELD_PREP(HHI_MIPI_CNTL2_DIF_TX_CTL0, 0x45a) |
++		     FIELD_PREP(HHI_MIPI_CNTL2_DIF_TX_CTL1, 0x2680));
++
++	reg = DSI_LANE_CLK;
++	switch (priv->config.lanes) {
++	case 4:
++		reg |= DSI_LANE_3;
++		fallthrough;
++	case 3:
++		reg |= DSI_LANE_2;
++		fallthrough;
++	case 2:
++		reg |= DSI_LANE_1;
++		fallthrough;
++	case 1:
++		reg |= DSI_LANE_0;
++		break;
++	default:
++		reg = 0;
++	}
++
++	regmap_update_bits(priv->regmap, HHI_MIPI_CNTL2,
++			   HHI_MIPI_CNTL2_CH_EN,
++			   FIELD_PREP(HHI_MIPI_CNTL2_CH_EN, reg));
++
++	return 0;
++}
++
++static int phy_g12a_mipi_dphy_analog_power_off(struct phy *phy)
++{
++	struct phy_g12a_mipi_dphy_analog_priv *priv = dev_get_priv(phy->dev);
++
++	regmap_write(priv->regmap, HHI_MIPI_CNTL0, 0);
++	regmap_write(priv->regmap, HHI_MIPI_CNTL1, 0);
++	regmap_write(priv->regmap, HHI_MIPI_CNTL2, 0);
++
++	return 0;
++}
++
++static const struct phy_ops phy_g12a_mipi_dphy_analog_ops = {
++	.configure = phy_g12a_mipi_dphy_analog_configure,
++	.power_on = phy_g12a_mipi_dphy_analog_power_on,
++	.power_off = phy_g12a_mipi_dphy_analog_power_off,
++};
++
++static int phy_g12a_mipi_dphy_analog_probe(struct udevice *dev)
++{
++	struct phy_g12a_mipi_dphy_analog_priv *priv = dev_get_priv(dev);
++
++	/* The registers live in the parent HHI system controller */
++	priv->regmap = syscon_node_to_regmap(dev_ofnode(dev_get_parent(dev)));
++	if (IS_ERR(priv->regmap))
++		return PTR_ERR(priv->regmap);
++
++	return 0;
++}
++
++static const struct udevice_id phy_g12a_mipi_dphy_analog_ids[] = {
++	{ .compatible = "amlogic,g12a-mipi-dphy-analog" },
++	{ }
++};
++
++U_BOOT_DRIVER(phy_g12a_mipi_dphy_analog) = {
++	.name = "phy_g12a_mipi_dphy_analog",
++	.id = UCLASS_PHY,
++	.of_match = phy_g12a_mipi_dphy_analog_ids,
++	.probe = phy_g12a_mipi_dphy_analog_probe,
++	.ops = &phy_g12a_mipi_dphy_analog_ops,
++	.priv_auto = sizeof(struct phy_g12a_mipi_dphy_analog_priv),
++};
+diff --git a/drivers/pwm/pwm-meson.c b/drivers/pwm/pwm-meson.c
+index caa7af08..be9fa95a 100644
+--- a/drivers/pwm/pwm-meson.c
++++ b/drivers/pwm/pwm-meson.c
+@@ -94,6 +94,13 @@ struct meson_pwm {
+ 
+ static int meson_pwm_set_enable(struct udevice *dev, uint channel, bool enable);
+ 
++/* The xtal is a "fixed-clock" node: the driver is named "fixed_clock" */
++static bool meson_pwm_clk_is_fixed(struct udevice *cdev)
++{
++	return !strcmp(cdev->driver->name, "fixed_clock") ||
++	       !strcmp(cdev->driver->name, "fixed_rate_clock");
++}
++
+ static int meson_pwm_set_config(struct udevice *dev, uint channeln,
+ 				 uint period_ns, uint duty_ns)
+ {
+@@ -217,7 +224,7 @@ static int meson_pwm_set_enable(struct udevice *dev, uint channeln, bool enable)
+ 			return 0;
+ 
+ 		value = readl(priv->base + REG_MISC_AB);
+-		value &= channel_data->pwm_en_mask;
++		value &= ~channel_data->pwm_en_mask;
+ 		writel(value, priv->base + REG_MISC_AB);
+ 
+ 		debug("%s%d: disabled\n", __func__, channeln);
+@@ -299,7 +306,7 @@ static int meson_pwm_probe(struct udevice *dev)
+ 					return err;
+ 
+ 				uclass_foreach_dev(cdev, uc) {
+-					if (strcmp(cdev->driver->name, "fixed_rate_clock"))
++					if (!meson_pwm_clk_is_fixed(cdev))
+ 						continue;
+ 
+ 					str = ofnode_read_string(dev_ofnode(cdev),
+@@ -365,7 +372,7 @@ static int meson_pwm_probe(struct udevice *dev)
+ 
+ 		/* Get id in list */
+ 		for (p = 0 ; p < data->num_parents ; ++p) {
+-			if (!strcmp(channel->clk.dev->driver->name, "fixed_rate_clock")) {
++			if (meson_pwm_clk_is_fixed(channel->clk.dev)) {
+ 				if (data->parent_ids[p] == -1)
+ 					break;
+ 			} else {
+@@ -386,7 +393,7 @@ static int meson_pwm_probe(struct udevice *dev)
+ 		debug("%s%d: switching parent %d to %d\n", __func__, i,
+ 		      (reg >> channel_data->clk_sel_shift) & MISC_CLK_SEL_MASK, p);
+ 
+-		reg &= MISC_CLK_SEL_MASK << channel_data->clk_sel_shift;
++		reg &= ~(MISC_CLK_SEL_MASK << channel_data->clk_sel_shift);
+ 		reg |= (p & MISC_CLK_SEL_MASK) << channel_data->clk_sel_shift;
+ 		writel(reg, priv->base + REG_MISC_AB);
+ 	}
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index 15000e21..e6628bd4 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -559,6 +559,15 @@ config VIDEO_LCD_HIMAX_HX8394
+ 	  Say Y here if you want to enable support for Himax HX8394
+ 	  dsi 4dl panel.
+ 
++config VIDEO_LCD_SITRONIX_ST7701
++	bool "Sitronix ST7701 MIPI DSI LCD panel support"
++	depends on PANEL && BACKLIGHT
++	select VIDEO_MIPI_DSI
++	help
++	  Say Y here to enable support for the ST7701 based MIPI DSI panel
++	  of the ODROID-GO Ultra and the Powkiddy RGB10 Max 3 Pro
++	  (480x854, 2 lanes).
++
+ config VIDEO_LCD_ILITEK_ILI9806E
+ 	bool "Ilitek ILI9806E-based panels"
+ 	depends on PANEL && BACKLIGHT
+diff --git a/drivers/video/Makefile b/drivers/video/Makefile
+index 082b8967..6188057e 100644
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -59,6 +59,7 @@ obj-$(CONFIG_VIDEO_IVYBRIDGE_IGD) += ivybridge_igd.o
+ obj-$(CONFIG_VIDEO_LCD_PANEL_EDP_4_LANE_1620M_VIA_ANX9804) += anx9804.o
+ obj-$(CONFIG_VIDEO_LCD_ENDEAVORU) += endeavoru-panel.o
+ obj-$(CONFIG_VIDEO_LCD_HIMAX_HX8394) += himax-hx8394.o
++obj-$(CONFIG_VIDEO_LCD_SITRONIX_ST7701) += sitronix-st7701.o
+ obj-$(CONFIG_VIDEO_LCD_HITACHI_TX10D07VM0BAA) += hitachi-tx10d07vm0baa.o
+ obj-$(CONFIG_VIDEO_LCD_HITACHI_TX18D42VM) += hitachi_tx18d42vm_lcd.o
+ obj-$(CONFIG_VIDEO_LCD_ILITEK_ILI9806E) += ilitek-ili9806e.o
+diff --git a/drivers/video/dw_mipi_dsi.c b/drivers/video/dw_mipi_dsi.c
+index ec5d4c81..69088372 100644
+--- a/drivers/video/dw_mipi_dsi.c
++++ b/drivers/video/dw_mipi_dsi.c
+@@ -805,10 +805,12 @@ static int dw_mipi_dsi_init(struct udevice *dev,
+ 	}
+ 
+ 	/*
+-	 * The Rockchip based devices don't have px_clk, so simply move
+-	 * on.
++	 * The Rockchip based devices don't have px_clk, and the Amlogic
++	 * glue sets the pixel clock itself and passes it in the timings,
++	 * so simply move on.
+ 	 */
+-	if (IS_ENABLED(CONFIG_DISPLAY_ROCKCHIP_DW_MIPI)) {
++	if (IS_ENABLED(CONFIG_DISPLAY_ROCKCHIP_DW_MIPI) ||
++	    IS_ENABLED(CONFIG_VIDEO_MESON_DW_MIPI_DSI)) {
+ 		dw_mipi_dsi_bridge_set(dsi, timings);
+ 		return 0;
+ 	}
+diff --git a/drivers/video/meson/Kconfig b/drivers/video/meson/Kconfig
+index 77c30173..2e3c8d2d 100644
+--- a/drivers/video/meson/Kconfig
++++ b/drivers/video/meson/Kconfig
+@@ -11,3 +11,20 @@ config VIDEO_MESON
+ 	imply VIDEO_DAMAGE
+ 	help
+ 	  Enable Amlogic Meson Video Processing Unit video support.
++
++config VIDEO_MESON_DW_MIPI_DSI
++	bool "Amlogic Meson MIPI DSI output"
++	depends on VIDEO_MESON && MESON_G12A
++	select VIDEO_BRIDGE
++	select VIDEO_DW_MIPI_DSI
++	select PANEL
++	select PHY
++	select MESON_AXG_MIPI_DPHY
++	select MESON_G12A_MIPI_DPHY_ANALOG
++	select REGMAP
++	select SYSCON
++	help
++	  Drive a MIPI DSI panel from the Amlogic G12A/G12B/SM1 VPU (ENCL)
++	  through the Synopsys DW MIPI DSI host. When the DSI node and its
++	  panel are enabled in the device tree, the panel is used instead of
++	  HDMI/CVBS.
+diff --git a/drivers/video/meson/Makefile b/drivers/video/meson/Makefile
+index 1e929b34..a501fb0c 100644
+--- a/drivers/video/meson/Makefile
++++ b/drivers/video/meson/Makefile
+@@ -7,3 +7,4 @@
+ obj-$(CONFIG_VIDEO_MESON) = meson_vpu.o meson_vpu_init.o meson_canvas.o
+ obj-$(CONFIG_VIDEO_MESON) += meson_plane.o meson_venc.o meson_vclk.o
+ obj-$(CONFIG_VIDEO_MESON) += meson_dw_hdmi.o simplefb_common.o ../dw_hdmi.o
++obj-$(CONFIG_VIDEO_MESON_DW_MIPI_DSI) += meson_dw_mipi_dsi.o
+diff --git a/drivers/video/meson/meson_dw_mipi_dsi.c b/drivers/video/meson/meson_dw_mipi_dsi.c
+new file mode 100644
+index 00000000..c924e5e9
+--- /dev/null
++++ b/drivers/video/meson/meson_dw_mipi_dsi.c
+@@ -0,0 +1,559 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Amlogic Meson G12A/G12B/SM1 MIPI DSI glue for the Synopsys DW MIPI DSI host
++ *
++ * Based on the Linux meson_dw_mipi_dsi driver:
++ * Copyright (C) 2021 BayLibre, SAS
++ * Author: Neil Armstrong <narmstrong@baylibre.com>
++ * Copyright (C) 2015 Amlogic, Inc. All rights reserved.
++ *
++ * Linux sets the DSI clocks through the common clock framework, which the
++ * U-Boot G12A clock driver doesn't model (GP0 PLL, VCLK2, ENCL, DSI pixel
++ * clock), so this driver programs them in the HHI registers directly, the
++ * way the Amlogic BSP U-Boot does:
++ *
++ *   GP0 PLL = DSI lane bit rate  -> mipi_dsi_pxclk (DSI host/PHY bit clock)
++ *   GP0 PLL / (bpp / lanes)      -> VCLK2 -> cts_encl (ENCL pixel clock)
++ */
++
++#include <clk.h>
++#include <div64.h>
++#include <display.h>
++#include <dm.h>
++#include <dsi_host.h>
++#include <generic-phy.h>
++#include <log.h>
++#include <mipi_dsi.h>
++#include <panel.h>
++#include <phy-mipi-dphy.h>
++#include <regmap.h>
++#include <reset.h>
++#include <syscon.h>
++#include <video_bridge.h>
++#include <asm/io.h>
++#include <dm/device_compat.h>
++#include <dm/lists.h>
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/iopoll.h>
++
++#include "meson_registers.h"
++
++/* DSI TOP registers, in the DSI host register space */
++#define MIPI_DSI_TOP_SW_RESET		0x3c0
++#define		MIPI_DSI_TOP_SW_RESET_DWC	BIT(0)
++#define		MIPI_DSI_TOP_SW_RESET_INTR	BIT(1)
++#define		MIPI_DSI_TOP_SW_RESET_DPI	BIT(2)
++#define		MIPI_DSI_TOP_SW_RESET_TIMING	BIT(3)
++#define MIPI_DSI_TOP_CLK_CNTL		0x3c4
++#define		MIPI_DSI_TOP_CLK_SYSCLK_EN	BIT(0)
++#define		MIPI_DSI_TOP_CLK_PIXCLK_EN	BIT(1)
++#define MIPI_DSI_TOP_CNTL		0x3c8
++#define		MIPI_DSI_TOP_DPI_COLOR_MODE	GENMASK(23, 20)
++#define		MIPI_DSI_TOP_IN_COLOR_MODE	GENMASK(18, 16)
++#define		MIPI_DSI_TOP_COMP2_SEL		GENMASK(13, 12)
++#define		MIPI_DSI_TOP_COMP1_SEL		GENMASK(11, 10)
++#define		MIPI_DSI_TOP_COMP0_SEL		GENMASK(9, 8)
++#define MIPI_DSI_TOP_MEM_PD		0x3f4
++
++#define VENC_IN_COLOR_24B		0x1
++#define VENC_IN_COLOR_18B		0x2
++#define DPI_COLOR_18BIT_CFG_2		4
++#define DPI_COLOR_24BIT			5
++
++/* HHI clock registers */
++#define HHI_GP0_PLL_CNTL0		0x040
++#define		GP0_PLL_LOCK			BIT(31)
++#define		GP0_PLL_RST			BIT(29)
++#define		GP0_PLL_EN			BIT(28)
++#define		GP0_PLL_OD			GENMASK(18, 16)
++#define		GP0_PLL_N			GENMASK(14, 10)
++#define		GP0_PLL_M			GENMASK(7, 0)
++#define HHI_GP0_PLL_CNTL1		0x044
++#define HHI_GP0_PLL_CNTL2		0x048
++#define HHI_GP0_PLL_CNTL3		0x04c
++#define HHI_GP0_PLL_CNTL4		0x050
++#define HHI_GP0_PLL_CNTL5		0x054
++#define HHI_GP0_PLL_CNTL6		0x058
++#define HHI_VIID_CLK_DIV		0x128
++#define		VIID_CLK_DIV_XD			GENMASK(7, 0)
++#define		VIID_CLK_DIV_ENCL_SEL		GENMASK(15, 12)
++#define		VIID_CLK_DIV_EN			BIT(16)
++#define		VIID_CLK_DIV_RST		BIT(17)
++#define HHI_VIID_CLK_CNTL		0x12c
++#define		VIID_CLK_CNTL_DIV1_EN		BIT(0)
++#define		VIID_CLK_CNTL_SOFT_RST		BIT(15)
++#define		VIID_CLK_CNTL_SEL		GENMASK(18, 16)
++#define		VIID_CLK_CNTL_EN		BIT(19)
++#define HHI_VID_CLK_CNTL2		0x194
++#define		VID_CLK_CNTL2_ENCL_GATE		BIT(3)
++#define HHI_MIPIDSI_PHY_CLK_CNTL	0x254
++#define		MIPIDSI_PXCLK_DIV		GENMASK(6, 0)
++#define		MIPIDSI_PXCLK_EN		BIT(8)
++#define		MIPIDSI_PXCLK_SEL		GENMASK(14, 12)
++
++#define CLK_SRC_GP0			1	/* VCLK2 and DSI pxclk muxes */
++#define CTS_ENCL_SEL_VCLK2_DIV1		8
++
++#define XTAL_RATE			24000000UL
++#define GP0_M_MIN			125
++#define GP0_M_MAX			255
++
++struct meson_dw_mipi_dsi_priv {
++	void __iomem *base;
++	struct regmap *hhi;
++	struct clk pclk;
++	struct reset_ctl top_rst;
++	struct phy phy;
++	struct phy_configure_opts_mipi_dphy phy_opts;
++	struct mipi_dsi_device device;
++	struct udevice *panel;
++	struct udevice *dsi_host;
++	struct display_timing timings;
++	unsigned int bpp;
++};
++
++static struct meson_dw_mipi_dsi_priv *dsi_priv(void *priv_data)
++{
++	struct mipi_dsi_device *device = priv_data;
++
++	return dev_get_priv(device->dev);
++}
++
++/*
++ * Pick an integer GP0 PLL setting for the wanted rate:
++ * rate = 24 MHz * m >> od, with the DCO (24 MHz * m) at 3 - 6.12 GHz.
++ * Returns the real rate.
++ */
++static unsigned long meson_dsi_gp0_calc(unsigned long rate, unsigned int *m,
++					unsigned int *od)
++{
++	unsigned int i;
++
++	for (i = 0; i <= 4; i++) {
++		u64 dco = (u64)rate << i;
++		unsigned long mm = DIV_ROUND_CLOSEST_ULL(dco, XTAL_RATE);
++
++		if (mm < GP0_M_MIN || mm > GP0_M_MAX)
++			continue;
++
++		*m = mm;
++		*od = i;
++		return (XTAL_RATE * mm) >> i;
++	}
++
++	return 0;
++}
++
++static int meson_dsi_set_gp0(struct meson_dw_mipi_dsi_priv *priv,
++			     unsigned int m, unsigned int od)
++{
++	unsigned int val;
++	int ret;
++
++	regmap_write(priv->hhi, HHI_GP0_PLL_CNTL0,
++		     GP0_PLL_RST | GP0_PLL_EN |
++		     FIELD_PREP(GP0_PLL_OD, od) |
++		     FIELD_PREP(GP0_PLL_N, 1) |
++		     FIELD_PREP(GP0_PLL_M, m));
++	regmap_write(priv->hhi, HHI_GP0_PLL_CNTL1, 0);
++	regmap_write(priv->hhi, HHI_GP0_PLL_CNTL2, 0);
++	regmap_write(priv->hhi, HHI_GP0_PLL_CNTL3, 0x48681c00);
++	regmap_write(priv->hhi, HHI_GP0_PLL_CNTL4, 0x33771290);
++	regmap_write(priv->hhi, HHI_GP0_PLL_CNTL5, 0x39272000);
++	regmap_write(priv->hhi, HHI_GP0_PLL_CNTL6, 0x56540000);
++	udelay(100);
++	regmap_update_bits(priv->hhi, HHI_GP0_PLL_CNTL0, GP0_PLL_RST, 0);
++
++	ret = regmap_read_poll_timeout(priv->hhi, HHI_GP0_PLL_CNTL0, val,
++				       val & GP0_PLL_LOCK, 10, 10000);
++	if (ret)
++		return -EIO;
++
++	return 0;
++}
++
++static void meson_dsi_set_clocks(struct meson_dw_mipi_dsi_priv *priv,
++				 unsigned int encl_div)
++{
++	/* DSI bit clock: GP0 / 1 */
++	regmap_update_bits(priv->hhi, HHI_MIPIDSI_PHY_CLK_CNTL,
++			   MIPIDSI_PXCLK_SEL | MIPIDSI_PXCLK_DIV,
++			   FIELD_PREP(MIPIDSI_PXCLK_SEL, CLK_SRC_GP0));
++	regmap_update_bits(priv->hhi, HHI_MIPIDSI_PHY_CLK_CNTL,
++			   MIPIDSI_PXCLK_EN, MIPIDSI_PXCLK_EN);
++
++	/* ENCL pixel clock: GP0 -> VCLK2 / encl_div -> vclk2_div1 -> cts_encl */
++	regmap_update_bits(priv->hhi, HHI_VID_CLK_CNTL2,
++			   VID_CLK_CNTL2_ENCL_GATE, 0);
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_CNTL, VIID_CLK_CNTL_EN, 0);
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_DIV,
++			   VIID_CLK_DIV_EN | VIID_CLK_DIV_RST, 0);
++
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_DIV, VIID_CLK_DIV_XD,
++			   FIELD_PREP(VIID_CLK_DIV_XD, encl_div - 1));
++	udelay(5);
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_CNTL, VIID_CLK_CNTL_SEL,
++			   FIELD_PREP(VIID_CLK_CNTL_SEL, CLK_SRC_GP0));
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_CNTL, VIID_CLK_CNTL_EN,
++			   VIID_CLK_CNTL_EN);
++	udelay(2);
++
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_DIV, VIID_CLK_DIV_ENCL_SEL,
++			   FIELD_PREP(VIID_CLK_DIV_ENCL_SEL,
++				      CTS_ENCL_SEL_VCLK2_DIV1));
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_DIV, VIID_CLK_DIV_EN,
++			   VIID_CLK_DIV_EN);
++	udelay(5);
++
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_CNTL, VIID_CLK_CNTL_DIV1_EN,
++			   VIID_CLK_CNTL_DIV1_EN);
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_CNTL, VIID_CLK_CNTL_SOFT_RST,
++			   VIID_CLK_CNTL_SOFT_RST);
++	udelay(10);
++	regmap_update_bits(priv->hhi, HHI_VIID_CLK_CNTL, VIID_CLK_CNTL_SOFT_RST,
++			   0);
++	udelay(5);
++
++	regmap_update_bits(priv->hhi, HHI_VID_CLK_CNTL2,
++			   VID_CLK_CNTL2_ENCL_GATE, VID_CLK_CNTL2_ENCL_GATE);
++}
++
++static void meson_dw_mipi_dsi_hw_init(struct meson_dw_mipi_dsi_priv *priv)
++{
++	const u32 rst = MIPI_DSI_TOP_SW_RESET_DWC | MIPI_DSI_TOP_SW_RESET_INTR |
++			MIPI_DSI_TOP_SW_RESET_DPI | MIPI_DSI_TOP_SW_RESET_TIMING;
++
++	/* Software reset */
++	writel_bits(rst, rst, priv->base + MIPI_DSI_TOP_SW_RESET);
++	writel_bits(rst, 0, priv->base + MIPI_DSI_TOP_SW_RESET);
++
++	/* Enable clocks */
++	writel_bits(MIPI_DSI_TOP_CLK_SYSCLK_EN | MIPI_DSI_TOP_CLK_PIXCLK_EN,
++		    MIPI_DSI_TOP_CLK_SYSCLK_EN | MIPI_DSI_TOP_CLK_PIXCLK_EN,
++		    priv->base + MIPI_DSI_TOP_CLK_CNTL);
++
++	/* Take memory out of power down */
++	writel(0, priv->base + MIPI_DSI_TOP_MEM_PD);
++}
++
++static int dsi_phy_init(void *priv_data)
++{
++	struct meson_dw_mipi_dsi_priv *priv = dsi_priv(priv_data);
++	unsigned int dpi_data_format, venc_data_width;
++	int ret;
++
++	switch (priv->device.format) {
++	case MIPI_DSI_FMT_RGB888:
++		dpi_data_format = DPI_COLOR_24BIT;
++		venc_data_width = VENC_IN_COLOR_24B;
++		break;
++	case MIPI_DSI_FMT_RGB666:
++		dpi_data_format = DPI_COLOR_18BIT_CFG_2;
++		venc_data_width = VENC_IN_COLOR_18B;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/* Configure color format for DPI register */
++	writel(FIELD_PREP(MIPI_DSI_TOP_DPI_COLOR_MODE, dpi_data_format) |
++	       FIELD_PREP(MIPI_DSI_TOP_IN_COLOR_MODE, venc_data_width) |
++	       FIELD_PREP(MIPI_DSI_TOP_COMP2_SEL, 2) |
++	       FIELD_PREP(MIPI_DSI_TOP_COMP1_SEL, 1) |
++	       FIELD_PREP(MIPI_DSI_TOP_COMP0_SEL, 0),
++	       priv->base + MIPI_DSI_TOP_CNTL);
++
++	ret = generic_phy_configure(&priv->phy, &priv->phy_opts);
++	if (ret) {
++		log_err("failed to configure the DSI PHY (%d)\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int dsi_get_lane_mbps(void *priv_data, struct display_timing *timings,
++			     u32 lanes, u32 format, unsigned int *lane_mbps)
++{
++	struct meson_dw_mipi_dsi_priv *priv = dsi_priv(priv_data);
++
++	*lane_mbps = DIV_ROUND_UP(priv->phy_opts.hs_clk_rate, 1000000);
++
++	return 0;
++}
++
++static int dsi_phy_get_timing(void *priv_data, unsigned int lane_mbps,
++			      struct mipi_dsi_phy_timing *timing)
++{
++	struct meson_dw_mipi_dsi_priv *priv = dsi_priv(priv_data);
++
++	switch (priv->timings.hactive.typ) {
++	case 240:
++	case 768:
++	case 1920:
++	case 2560:
++		timing->clk_lp2hs = 23;
++		timing->clk_hs2lp = 38;
++		timing->data_lp2hs = 15;
++		timing->data_hs2lp = 9;
++		break;
++	default:
++		timing->clk_lp2hs = 37;
++		timing->clk_hs2lp = 135;
++		timing->data_lp2hs = 50;
++		timing->data_hs2lp = 3;
++	}
++
++	return 0;
++}
++
++static void dsi_get_esc_clk_rate(void *priv_data, unsigned int *esc_clk_rate)
++{
++	*esc_clk_rate = 4; /* MHz */
++}
++
++static const struct mipi_dsi_phy_ops meson_dsi_phy_ops = {
++	.init = dsi_phy_init,
++	.get_lane_mbps = dsi_get_lane_mbps,
++	.get_timing = dsi_phy_get_timing,
++	.get_esc_clk_rate = dsi_get_esc_clk_rate,
++};
++
++static int meson_dw_mipi_dsi_attach(struct udevice *dev)
++{
++	struct meson_dw_mipi_dsi_priv *priv = dev_get_priv(dev);
++	struct mipi_dsi_device *device = &priv->device;
++	struct display_timing *timings = &priv->timings;
++	struct mipi_dsi_panel_plat *mplat;
++	unsigned long hs_rate, rate;
++	unsigned int m, od, encl_div;
++	int ret;
++
++	ret = uclass_first_device_err(UCLASS_PANEL, &priv->panel);
++	if (ret) {
++		dev_err(dev, "panel device error %d\n", ret);
++		return ret;
++	}
++
++	mplat = dev_get_plat(priv->panel);
++	mplat->device = device;
++	device->lanes = mplat->lanes;
++	device->format = mplat->format;
++	device->mode_flags = mplat->mode_flags;
++
++	ret = panel_get_display_timing(priv->panel, timings);
++	if (ret) {
++		ret = ofnode_decode_display_timing(dev_ofnode(priv->panel),
++						   0, timings);
++		if (ret) {
++			dev_err(dev, "decode display timing error %d\n", ret);
++			return ret;
++		}
++	}
++
++	if (device->format != MIPI_DSI_FMT_RGB888 &&
++	    device->format != MIPI_DSI_FMT_RGB666) {
++		dev_err(dev, "invalid pixel format %d\n", device->format);
++		return -EINVAL;
++	}
++
++	priv->bpp = mipi_dsi_pixel_format_to_bpp(device->format);
++	if (!device->lanes || priv->bpp % device->lanes) {
++		dev_err(dev, "unsupported lanes/format %u/%d\n",
++			device->lanes, device->format);
++		return -EINVAL;
++	}
++	encl_div = priv->bpp / device->lanes;
++
++	/*
++	 * One PLL feeds both clocks: lane bit rate = pixel clock * bpp / lanes
++	 * and pixel clock = bit rate / encl_div, so round the pixel clock to
++	 * what GP0 can do.
++	 */
++	hs_rate = meson_dsi_gp0_calc(timings->pixelclock.typ * encl_div,
++				     &m, &od);
++	if (!hs_rate) {
++		dev_err(dev, "pixel clock %u out of range\n",
++			timings->pixelclock.typ);
++		return -EINVAL;
++	}
++	rate = hs_rate / encl_div;
++	dev_dbg(dev, "pixel clock %u -> %lu Hz, lane rate %lu Hz\n",
++		timings->pixelclock.typ, rate, hs_rate);
++	timings->pixelclock.typ = rate;
++
++	ret = phy_mipi_dphy_get_default_config(rate, priv->bpp, device->lanes,
++					       &priv->phy_opts);
++	if (ret)
++		return ret;
++	priv->phy_opts.hs_clk_rate = hs_rate;
++
++	ret = meson_dsi_set_gp0(priv, m, od);
++	if (ret) {
++		dev_err(dev, "GP0 PLL failed to lock\n");
++		return ret;
++	}
++	meson_dsi_set_clocks(priv, encl_div);
++
++	ret = generic_phy_init(&priv->phy);
++	if (ret) {
++		dev_err(dev, "failed to init the DSI PHY (%d)\n", ret);
++		return ret;
++	}
++
++	meson_dw_mipi_dsi_hw_init(priv);
++
++	ret = uclass_get_device(UCLASS_DSI_HOST, 0, &priv->dsi_host);
++	if (ret) {
++		dev_err(dev, "No video dsi host detected %d\n", ret);
++		return ret;
++	}
++
++	ret = dsi_host_init(priv->dsi_host, device, timings, 4,
++			    &meson_dsi_phy_ops);
++	if (ret) {
++		dev_err(dev, "failed to initialize mipi dsi host\n");
++		return ret;
++	}
++
++	/* As in Linux: the D-PHY is powered on once the host is set up */
++	ret = generic_phy_power_on(&priv->phy);
++	if (ret) {
++		dev_err(dev, "failed to power on the DSI PHY (%d)\n", ret);
++		return ret;
++	}
++
++	/* No serial port on these boards: leave a trace in the console log */
++	printf("DSI:   %ux%u, %u lanes, %lu kHz pixel clock, phy status %#x\n",
++	       timings->hactive.typ, timings->vactive.typ, device->lanes,
++	       rate / 1000, readl(priv->base + 0xb0));
++
++	return 0;
++}
++
++static int meson_dw_mipi_dsi_get_display_timing(struct udevice *dev,
++						struct display_timing *timing)
++{
++	struct meson_dw_mipi_dsi_priv *priv = dev_get_priv(dev);
++
++	if (!priv->panel)
++		return -ENODEV;
++
++	memcpy(timing, &priv->timings, sizeof(*timing));
++
++	return 0;
++}
++
++static int meson_dw_mipi_dsi_set_backlight(struct udevice *dev, int percent)
++{
++	struct meson_dw_mipi_dsi_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	/* Sends the panel init sequence (command mode) and turns it on */
++	ret = panel_enable_backlight(priv->panel);
++	if (ret) {
++		dev_err(dev, "panel %s enable backlight error %d\n",
++			priv->panel->name, ret);
++		return ret;
++	}
++
++	ret = dsi_host_enable(priv->dsi_host);
++	if (ret) {
++		dev_err(dev, "failed to enable mipi dsi host\n");
++		return ret;
++	}
++
++	if (percent >= 0)
++		panel_set_backlight(priv->panel, percent);
++
++	return 0;
++}
++
++static int meson_dw_mipi_dsi_bind(struct udevice *dev)
++{
++	int ret;
++
++	ret = device_bind_driver_to_node(dev, "dw_mipi_dsi", "dsihost",
++					 dev_ofnode(dev), NULL);
++	if (ret)
++		return ret;
++
++	/* the panel */
++	return dm_scan_fdt_dev(dev);
++}
++
++static int meson_dw_mipi_dsi_probe(struct udevice *dev)
++{
++	struct meson_dw_mipi_dsi_priv *priv = dev_get_priv(dev);
++	ofnode hhi;
++	int ret;
++
++	priv->device.dev = dev;
++
++	priv->base = dev_read_addr_ptr(dev);
++	if (!priv->base)
++		return -EINVAL;
++
++	hhi = ofnode_by_compatible(ofnode_null(), "amlogic,meson-gx-hhi-sysctrl");
++	if (!ofnode_valid(hhi))
++		return -ENODEV;
++	priv->hhi = syscon_node_to_regmap(hhi);
++	if (IS_ERR(priv->hhi))
++		return PTR_ERR(priv->hhi);
++
++	ret = generic_phy_get_by_name(dev, "dphy", &priv->phy);
++	if (ret) {
++		dev_err(dev, "failed to get mipi dphy (%d)\n", ret);
++		return ret;
++	}
++
++	ret = clk_get_by_name(dev, "pclk", &priv->pclk);
++	if (ret) {
++		dev_err(dev, "failed to get pclk (%d)\n", ret);
++		return ret;
++	}
++	ret = clk_enable(&priv->pclk);
++	if (ret) {
++		dev_err(dev, "failed to enable pclk (%d)\n", ret);
++		return ret;
++	}
++
++	/*
++	 * A TOP reset signal is used because the APB reset signal is handled
++	 * by the TOP control registers.
++	 */
++	ret = reset_get_by_name(dev, "top", &priv->top_rst);
++	if (ret) {
++		dev_err(dev, "failed to get the top reset (%d)\n", ret);
++		return ret;
++	}
++	reset_assert(&priv->top_rst);
++	udelay(20);
++	reset_deassert(&priv->top_rst);
++
++	return 0;
++}
++
++static const struct video_bridge_ops meson_dw_mipi_dsi_ops = {
++	.attach = meson_dw_mipi_dsi_attach,
++	.set_backlight = meson_dw_mipi_dsi_set_backlight,
++	.get_display_timing = meson_dw_mipi_dsi_get_display_timing,
++};
++
++static const struct udevice_id meson_dw_mipi_dsi_ids[] = {
++	{ .compatible = "amlogic,meson-g12a-dw-mipi-dsi" },
++	{ }
++};
++
++U_BOOT_DRIVER(meson_dw_mipi_dsi) = {
++	.name		= "meson_dw_mipi_dsi",
++	.id		= UCLASS_VIDEO_BRIDGE,
++	.of_match	= meson_dw_mipi_dsi_ids,
++	.bind		= meson_dw_mipi_dsi_bind,
++	.probe		= meson_dw_mipi_dsi_probe,
++	.ops		= &meson_dw_mipi_dsi_ops,
++	.priv_auto	= sizeof(struct meson_dw_mipi_dsi_priv),
++};
+diff --git a/drivers/video/meson/meson_registers.h b/drivers/video/meson/meson_registers.h
+index f6a5d1ac..50fb4c28 100644
+--- a/drivers/video/meson/meson_registers.h
++++ b/drivers/video/meson/meson_registers.h
+@@ -1738,4 +1738,17 @@
+ #define VPP_RDARB_MODE 0x3978
+ #define VPP_RDARB_REQEN_SLV 0x3979
+ 
++
++/* ENCL (LCD encoder) fields */
++#define		ENCL_PX_LN_CNT_SHADOW_EN		BIT(15)
++#define		ENCL_VIDEO_MODE_ADV_VFIFO_EN		BIT(3)
++#define		ENCL_VIDEO_MODE_ADV_GAIN_HDTV		BIT(4)
++#define		ENCL_SEL_GAMMA_RGB_IN			BIT(10)
++#define		ENCL_VIDEO_FILT_CTRL_BYPASS_FILTER	BIT(12)
++#define		ENCL_VIDEO_RGBIN_RGB			BIT(0)
++#define		ENCL_VIDEO_RGBIN_ZBLK			BIT(1)
++#define		L_DITH_CNTL_DITH10_EN			BIT(10)
++#define		L_TCON_MISC_SEL_STV1			BIT(4)
++#define		L_TCON_MISC_SEL_STV2			BIT(5)
++
+ #endif /* __MESON_REGISTERS_H */
+diff --git a/drivers/video/meson/meson_venc.c b/drivers/video/meson/meson_venc.c
+index 1bc6aaf7..a94edd30 100644
+--- a/drivers/video/meson/meson_venc.c
++++ b/drivers/video/meson/meson_venc.c
+@@ -1567,3 +1567,151 @@ void meson_vpu_setup_venc(struct udevice *dev,
+ 
+ 	meson_venc_hdmi_mode_set(priv, mode);
+ }
++
++/*
++ * ENCL setup for the MIPI DSI output (the DSI host takes its DPI input from
++ * ENCL). Port of the Linux meson_venc_mipi_dsi_mode_set().
++ */
++void meson_vpu_setup_venc_dsi(struct udevice *dev,
++			      const struct display_timing *mode)
++{
++	struct meson_vpu_priv *priv = dev_get_priv(dev);
++	unsigned int hdisplay = mode->hactive.typ;
++	unsigned int hsync_start = hdisplay + mode->hfront_porch.typ;
++	unsigned int hsync_end = hsync_start + mode->hsync_len.typ;
++	unsigned int htotal = hsync_end + mode->hback_porch.typ;
++	unsigned int vdisplay = mode->vactive.typ;
++	unsigned int vsync_start = vdisplay + mode->vfront_porch.typ;
++	unsigned int vsync_end = vsync_start + mode->vsync_len.typ;
++	unsigned int vtotal = vsync_end + mode->vback_porch.typ;
++	unsigned int max_pxcnt = htotal - 1;
++	unsigned int max_lncnt = vtotal - 1;
++	unsigned int havon_begin = htotal - hsync_start;
++	unsigned int havon_end = havon_begin + hdisplay - 1;
++	unsigned int vavon_bline = vtotal - vsync_start;
++	unsigned int vavon_eline = vavon_bline + vdisplay - 1;
++	unsigned int hso_begin = 0;
++	unsigned int hso_end = hsync_end - hsync_start;
++	unsigned int vso_begin = 0;
++	unsigned int vso_end = 0;
++	unsigned int vso_bline = 0;
++	unsigned int vso_eline = vsync_end - vsync_start;
++
++	meson_vpp_setup_mux(priv, MESON_VIU_VPP_MUX_ENCL);
++
++	writel(0, priv->io_base + _REG(ENCL_VIDEO_EN));
++
++	writel(ENCL_PX_LN_CNT_SHADOW_EN, priv->io_base + _REG(ENCL_VIDEO_MODE));
++	writel(ENCL_VIDEO_MODE_ADV_VFIFO_EN | ENCL_VIDEO_MODE_ADV_GAIN_HDTV |
++	       ENCL_SEL_GAMMA_RGB_IN, priv->io_base + _REG(ENCL_VIDEO_MODE_ADV));
++
++	writel(ENCL_VIDEO_FILT_CTRL_BYPASS_FILTER,
++	       priv->io_base + _REG(ENCL_VIDEO_FILT_CTRL));
++	writel(max_pxcnt, priv->io_base + _REG(ENCL_VIDEO_MAX_PXCNT));
++	writel(max_lncnt, priv->io_base + _REG(ENCL_VIDEO_MAX_LNCNT));
++	writel(havon_begin, priv->io_base + _REG(ENCL_VIDEO_HAVON_BEGIN));
++	writel(havon_end, priv->io_base + _REG(ENCL_VIDEO_HAVON_END));
++	writel(vavon_bline, priv->io_base + _REG(ENCL_VIDEO_VAVON_BLINE));
++	writel(vavon_eline, priv->io_base + _REG(ENCL_VIDEO_VAVON_ELINE));
++
++	writel(hso_begin, priv->io_base + _REG(ENCL_VIDEO_HSO_BEGIN));
++	writel(hso_end, priv->io_base + _REG(ENCL_VIDEO_HSO_END));
++	writel(vso_begin, priv->io_base + _REG(ENCL_VIDEO_VSO_BEGIN));
++	writel(vso_end, priv->io_base + _REG(ENCL_VIDEO_VSO_END));
++	writel(vso_bline, priv->io_base + _REG(ENCL_VIDEO_VSO_BLINE));
++	writel(vso_eline, priv->io_base + _REG(ENCL_VIDEO_VSO_ELINE));
++	writel(ENCL_VIDEO_RGBIN_RGB | ENCL_VIDEO_RGBIN_ZBLK,
++	       priv->io_base + _REG(ENCL_VIDEO_RGBIN_CTRL));
++
++	/* default black pattern */
++	writel(0, priv->io_base + _REG(ENCL_TST_MDSEL));
++	writel(0, priv->io_base + _REG(ENCL_TST_Y));
++	writel(0, priv->io_base + _REG(ENCL_TST_CB));
++	writel(0, priv->io_base + _REG(ENCL_TST_CR));
++	writel(1, priv->io_base + _REG(ENCL_TST_EN));
++	writel_bits(ENCL_VIDEO_MODE_ADV_VFIFO_EN, 0,
++		    priv->io_base + _REG(ENCL_VIDEO_MODE_ADV));
++
++	writel(1, priv->io_base + _REG(ENCL_VIDEO_EN));
++
++	writel(0, priv->io_base + _REG(L_RGB_BASE_ADDR));
++	writel(0x400, priv->io_base + _REG(L_RGB_COEFF_ADDR)); /* Magic value */
++
++	writel(L_DITH_CNTL_DITH10_EN, priv->io_base + _REG(L_DITH_CNTL_ADDR));
++
++	/* DE signal for TTL */
++	writel(havon_begin, priv->io_base + _REG(L_OEH_HS_ADDR));
++	writel(havon_end + 1, priv->io_base + _REG(L_OEH_HE_ADDR));
++	writel(vavon_bline, priv->io_base + _REG(L_OEH_VS_ADDR));
++	writel(vavon_eline, priv->io_base + _REG(L_OEH_VE_ADDR));
++
++	/* DE signal for TTL */
++	writel(havon_begin, priv->io_base + _REG(L_OEV1_HS_ADDR));
++	writel(havon_end + 1, priv->io_base + _REG(L_OEV1_HE_ADDR));
++	writel(vavon_bline, priv->io_base + _REG(L_OEV1_VS_ADDR));
++	writel(vavon_eline, priv->io_base + _REG(L_OEV1_VE_ADDR));
++
++	/* Hsync signal for TTL */
++	if (mode->flags & DISPLAY_FLAGS_HSYNC_HIGH) {
++		writel(hso_begin, priv->io_base + _REG(L_STH1_HS_ADDR));
++		writel(hso_end, priv->io_base + _REG(L_STH1_HE_ADDR));
++	} else {
++		writel(hso_end, priv->io_base + _REG(L_STH1_HS_ADDR));
++		writel(hso_begin, priv->io_base + _REG(L_STH1_HE_ADDR));
++	}
++	writel(0, priv->io_base + _REG(L_STH1_VS_ADDR));
++	writel(max_lncnt, priv->io_base + _REG(L_STH1_VE_ADDR));
++
++	/* Vsync signal for TTL */
++	writel(vso_begin, priv->io_base + _REG(L_STV1_HS_ADDR));
++	writel(vso_end, priv->io_base + _REG(L_STV1_HE_ADDR));
++	if (mode->flags & DISPLAY_FLAGS_VSYNC_HIGH) {
++		writel(vso_bline, priv->io_base + _REG(L_STV1_VS_ADDR));
++		writel(vso_eline, priv->io_base + _REG(L_STV1_VE_ADDR));
++	} else {
++		writel(vso_eline, priv->io_base + _REG(L_STV1_VS_ADDR));
++		writel(vso_bline, priv->io_base + _REG(L_STV1_VE_ADDR));
++	}
++
++	/* DE signal */
++	writel(havon_begin, priv->io_base + _REG(L_DE_HS_ADDR));
++	writel(havon_end + 1, priv->io_base + _REG(L_DE_HE_ADDR));
++	writel(vavon_bline, priv->io_base + _REG(L_DE_VS_ADDR));
++	writel(vavon_eline, priv->io_base + _REG(L_DE_VE_ADDR));
++
++	/* Hsync signal */
++	writel(hso_begin, priv->io_base + _REG(L_HSYNC_HS_ADDR));
++	writel(hso_end, priv->io_base + _REG(L_HSYNC_HE_ADDR));
++	writel(0, priv->io_base + _REG(L_HSYNC_VS_ADDR));
++	writel(max_lncnt, priv->io_base + _REG(L_HSYNC_VE_ADDR));
++
++	/* Vsync signal */
++	writel(vso_begin, priv->io_base + _REG(L_VSYNC_HS_ADDR));
++	writel(vso_end, priv->io_base + _REG(L_VSYNC_HE_ADDR));
++	writel(vso_bline, priv->io_base + _REG(L_VSYNC_VS_ADDR));
++	writel(vso_eline, priv->io_base + _REG(L_VSYNC_VE_ADDR));
++
++	writel(0, priv->io_base + _REG(L_INV_CNT_ADDR));
++	writel(L_TCON_MISC_SEL_STV1 | L_TCON_MISC_SEL_STV2,
++	       priv->io_base + _REG(L_TCON_MISC_SEL_ADDR));
++}
++
++/*
++ * Start the ENCL output once the DSI host is up, as the Linux
++ * meson_encoder_dsi_atomic_enable() does. The panel takes RGB, so the OSD1
++ * RGB to YUV matrix (loaded for HDMI) is bypassed.
++ */
++void meson_vpu_enable_venc_dsi(struct udevice *dev)
++{
++	struct meson_vpu_priv *priv = dev_get_priv(dev);
++
++	writel(0, priv->io_base + _REG(ENCL_VIDEO_EN));
++
++	writel_bits(ENCL_VIDEO_MODE_ADV_VFIFO_EN, ENCL_VIDEO_MODE_ADV_VFIFO_EN,
++		    priv->io_base + _REG(ENCL_VIDEO_MODE_ADV));
++	writel(0, priv->io_base + _REG(ENCL_TST_EN));
++
++	writel_bits(BIT(0), 0, priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_EN_CTRL));
++
++	writel(1, priv->io_base + _REG(ENCL_VIDEO_EN));
++}
+diff --git a/drivers/video/meson/meson_vpu.c b/drivers/video/meson/meson_vpu.c
+index a686faf9..cafcf2d5 100644
+--- a/drivers/video/meson/meson_vpu.c
++++ b/drivers/video/meson/meson_vpu.c
+@@ -12,6 +12,7 @@
+ #include <fdt_support.h>
+ #include <log.h>
+ #include <part.h>
++#include <video_bridge.h>
+ #include <linux/sizes.h>
+ #include <asm/arch/mem.h>
+ #include <asm/global_data.h>
+@@ -31,6 +32,7 @@ static struct meson_framebuffer {
+ 	unsigned int xsize;
+ 	unsigned int ysize;
+ 	bool is_cvbs;
++	bool is_dsi;
+ } meson_fb = { 0 };
+ 
+ bool meson_vpu_is_compatible(struct meson_vpu_priv *priv,
+@@ -96,6 +98,68 @@ cvbs:
+ 	return 0;
+ }
+ 
++/*
++ * MIPI DSI panel: the meson_dw_mipi_dsi bridge brings up the clocks, the PHY
++ * and the DSI host, the VPU feeds it from ENCL.
++ */
++static int meson_vpu_setup_dsi(struct udevice *dev, struct udevice *bridge)
++{
++	struct video_uc_plat *uc_plat = dev_get_uclass_plat(dev);
++	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
++	struct display_timing timing;
++	struct udevice *panel;
++	u32 rotation;
++	int ret;
++
++	ret = video_bridge_attach(bridge);
++	if (ret) {
++		debug("%s: DSI attach failed: %d\n", __func__, ret);
++		return ret;
++	}
++
++	ret = video_bridge_get_display_timing(bridge, &timing);
++	if (ret)
++		return ret;
++
++	uc_priv->xsize = timing.hactive.typ;
++	uc_priv->ysize = timing.vactive.typ;
++	uc_priv->bpix = VPU_MAX_LOG2_BPP;
++
++	/* "rotation" of the panel (as in Linux) turns the console */
++	if (IS_ENABLED(CONFIG_CONSOLE_ROTATION) &&
++	    !uclass_first_device_err(UCLASS_PANEL, &panel) &&
++	    !dev_read_u32(panel, "rotation", &rotation))
++		uc_priv->rot = (rotation / 90) & 3;
++
++	meson_fb.is_cvbs = false;
++	meson_fb.is_dsi = true;
++	meson_fb.xsize = uc_priv->xsize;
++	meson_fb.ysize = uc_priv->ysize;
++
++	/* Move the framebuffer to the end of addressable ram */
++	meson_fb.fb_size = ALIGN(meson_fb.xsize * meson_fb.ysize *
++				 ((1 << VPU_MAX_LOG2_BPP) / 8) +
++				 MESON_VPU_OVERSCAN, EFI_PAGE_SIZE);
++	meson_fb.base = gd->dram[0].start +
++			gd->dram[0].size - meson_fb.fb_size;
++
++	/* Override the framebuffer address */
++	uc_plat->base = meson_fb.base;
++
++	meson_vpu_setup_plane(dev, false);
++	meson_vpu_setup_venc_dsi(dev, &timing);
++	meson_vpu_enable_venc_dsi(dev);
++
++	/* Panel init sequence, DSI video mode, then the backlight */
++	ret = video_bridge_set_backlight(bridge, 80);
++	if (ret)
++		return ret;
++
++	video_set_flush_dcache(dev, 1);
++
++	return 0;
++}
++
+ static const struct udevice_id meson_vpu_ids[] = {
+ 	{ .compatible = "amlogic,meson-gxbb-vpu", .data = VPU_COMPATIBLE_GXBB },
+ 	{ .compatible = "amlogic,meson-gxl-vpu", .data = VPU_COMPATIBLE_GXL },
+@@ -130,6 +194,16 @@ static int meson_vpu_probe(struct udevice *dev)
+ 
+ 	meson_vpu_init(dev);
+ 
++	/* a MIPI DSI panel comes first */
++	if (IS_ENABLED(CONFIG_VIDEO_MESON_DW_MIPI_DSI) &&
++	    !uclass_first_device_err(UCLASS_VIDEO_BRIDGE, &disp)) {
++		ret = meson_vpu_setup_dsi(dev, disp);
++		if (!ret)
++			return 0;
++		printf("meson_vpu: DSI panel setup failed (%d)\n", ret);
++		meson_fb.is_dsi = false;
++	}
++
+ 	/* probe the display */
+ 	ret = uclass_get_device(UCLASS_DISPLAY, 0, &disp);
+ 
+@@ -155,6 +229,8 @@ static void meson_vpu_setup_simplefb(void *fdt)
+ 
+ 	if (meson_fb.is_cvbs)
+ 		pipeline = "vpu-cvbs";
++	else if (meson_fb.is_dsi)
++		pipeline = "vpu-dsi";
+ 	else
+ 		pipeline = "vpu-hdmi";
+ 
+diff --git a/drivers/video/meson/meson_vpu.h b/drivers/video/meson/meson_vpu.h
+index d9588c37..9a43d562 100644
+--- a/drivers/video/meson/meson_vpu.h
++++ b/drivers/video/meson/meson_vpu.h
+@@ -74,6 +74,8 @@ void meson_canvas_setup(struct meson_vpu_priv *priv,
+ 			unsigned int wrap,
+ 			unsigned int blkmode);
+ 
++/* Mux VIU/VPP to ENCL */
++#define MESON_VIU_VPP_MUX_ENCL	0x0
+ /* Mux VIU/VPP to ENCI */
+ #define MESON_VIU_VPP_MUX_ENCI	0x5
+ /* Mux VIU/VPP to ENCP */
+@@ -89,4 +91,7 @@ bool meson_vclk_dmt_supported_freq(struct meson_vpu_priv *priv,
+ 				   unsigned int freq);
+ void meson_vpu_setup_vclk(struct udevice *dev,
+ 			  const struct display_timing *mode, bool is_cvbs);
++void meson_vpu_setup_venc_dsi(struct udevice *dev,
++			      const struct display_timing *mode);
++void meson_vpu_enable_venc_dsi(struct udevice *dev);
+ #endif
+diff --git a/drivers/video/sitronix-st7701.c b/drivers/video/sitronix-st7701.c
+new file mode 100644
+index 00000000..e28932ef
+--- /dev/null
++++ b/drivers/video/sitronix-st7701.c
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Sitronix ST7701 MIPI DSI panel: the ODROID-GO Ultra / Powkiddy RGB10 Max 3
++ * Pro 480x854 panel (Elida KD50T048A).
++ *
++ * The init sequence and the mode are the ones of the Linux
++ * panel-sitronix-st7701 driver ("odroid,go-ultra-panel"), which took the
++ * sequence from the Hardkernel ODROID-GO Ultra BSP U-Boot.
++ */
++
++#include <backlight.h>
++#include <dm.h>
++#include <mipi_dsi.h>
++#include <panel.h>
++#include <asm/gpio.h>
++#include <dm/device_compat.h>
++#include <linux/delay.h>
++#include <power/regulator.h>
++
++struct st7701_panel_priv {
++	struct udevice *vcc;
++	struct udevice *iovcc;
++	struct gpio_desc reset;
++	struct udevice *backlight;
++};
++
++static const struct display_timing go_ultra_timing = {
++	.pixelclock.typ		= 29170000,
++	.hactive.typ		= 480,
++	.hfront_porch.typ	= 12,
++	.hsync_len.typ		= 12,
++	.hback_porch.typ	= 38,
++	.vactive.typ		= 854,
++	.vfront_porch.typ	= 2,
++	.vsync_len.typ		= 19,
++	.vback_porch.typ	= 22,
++};
++
++#define dsi_dcs_write_seq(device, seq...) do {					\
++		static const u8 d[] = { seq };					\
++		int ret;							\
++		ret = mipi_dsi_dcs_write_buffer(device, d, ARRAY_SIZE(d));	\
++		if (ret < 0)							\
++			return ret;						\
++	} while (0)
++
++static int st7701_go_ultra_init(struct mipi_dsi_device *device)
++{
++	dsi_dcs_write_seq(device, MIPI_DCS_SOFT_RESET);
++	mdelay(5);
++	dsi_dcs_write_seq(device, MIPI_DCS_EXIT_SLEEP_MODE);
++	mdelay(120);
++
++	/* Command2, BK0 */
++	dsi_dcs_write_seq(device, 0xff, 0x77, 0x01, 0x00, 0x00, 0x10);
++	dsi_dcs_write_seq(device, 0xc0, 0xe9, 0x03);
++	dsi_dcs_write_seq(device, 0xc1, 0x11, 0x02);
++	dsi_dcs_write_seq(device, 0xc2, 0x31, 0x08);
++	dsi_dcs_write_seq(device, 0xcc, 0x10);
++	dsi_dcs_write_seq(device, 0xb0, 0x00, 0x0d, 0x14, 0x0d, 0x10, 0x05,
++			  0x02, 0x08, 0x08, 0x1e, 0x05, 0x13, 0x11, 0xa3, 0x29,
++			  0x18);
++	dsi_dcs_write_seq(device, 0xb1, 0x00, 0x0c, 0x14, 0x0c, 0x10, 0x05,
++			  0x03, 0x08, 0x07, 0x20, 0x05, 0x13, 0x11, 0xa4, 0x29,
++			  0x18);
++
++	/* Command2, BK1 */
++	dsi_dcs_write_seq(device, 0xff, 0x77, 0x01, 0x00, 0x00, 0x11);
++	dsi_dcs_write_seq(device, 0xb0, 0x6c);
++	dsi_dcs_write_seq(device, 0xb1, 0x43);
++	dsi_dcs_write_seq(device, 0xb2, 0x07);
++	dsi_dcs_write_seq(device, 0xb3, 0x80);
++	dsi_dcs_write_seq(device, 0xb5, 0x47);
++	dsi_dcs_write_seq(device, 0xb7, 0x85);
++	dsi_dcs_write_seq(device, 0xb8, 0x20);
++	dsi_dcs_write_seq(device, 0xb9, 0x10);
++	dsi_dcs_write_seq(device, 0xc1, 0x78);
++	dsi_dcs_write_seq(device, 0xc3, 0x78);
++	dsi_dcs_write_seq(device, 0xd0, 0x88);
++	mdelay(120);
++
++	/* Gate driver (GIP) setup */
++	dsi_dcs_write_seq(device, 0xe0, 0x00, 0x00, 0x02);
++	dsi_dcs_write_seq(device, 0xe1, 0x08, 0x00, 0x0a, 0x00, 0x07, 0x00,
++			  0x09, 0x00, 0x00, 0x33, 0x33);
++	dsi_dcs_write_seq(device, 0xe2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++			  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
++	dsi_dcs_write_seq(device, 0xe3, 0x00, 0x00, 0x33, 0x33);
++	dsi_dcs_write_seq(device, 0xe4, 0x44, 0x44);
++	dsi_dcs_write_seq(device, 0xe5, 0x0e, 0x60, 0xa0, 0xa0, 0x10, 0x60,
++			  0xa0, 0xa0, 0x0a, 0x60, 0xa0, 0xa0, 0x0c, 0x60, 0xa0,
++			  0xa0);
++	dsi_dcs_write_seq(device, 0xe6, 0x00, 0x00, 0x33, 0x33);
++	dsi_dcs_write_seq(device, 0xe7, 0x44, 0x44);
++	dsi_dcs_write_seq(device, 0xe8, 0x0d, 0x60, 0xa0, 0xa0, 0x0f, 0x60,
++			  0xa0, 0xa0, 0x09, 0x60, 0xa0, 0xa0, 0x0b, 0x60, 0xa0,
++			  0xa0);
++	dsi_dcs_write_seq(device, 0xeb, 0x02, 0x01, 0xe4, 0xe4, 0x44, 0x00,
++			  0x40);
++	dsi_dcs_write_seq(device, 0xec, 0x02, 0x01);
++	dsi_dcs_write_seq(device, 0xed, 0xab, 0x89, 0x76, 0x54, 0x01, 0xff,
++			  0xff, 0xff, 0xff, 0xff, 0xff, 0x10, 0x45, 0x67, 0x98,
++			  0xba);
++
++	/* Disable Command2 */
++	dsi_dcs_write_seq(device, 0xff, 0x77, 0x01, 0x00, 0x00, 0x00);
++	dsi_dcs_write_seq(device, 0x3a, 0x70);
++	dsi_dcs_write_seq(device, 0x53, 0xec);
++	dsi_dcs_write_seq(device, 0x55, 0xb3);
++	dsi_dcs_write_seq(device, 0x5e, 0xff);
++	dsi_dcs_write_seq(device, MIPI_DCS_SET_DISPLAY_ON);
++	mdelay(50);
++
++	return 0;
++}
++
++/*
++ * Power a supply the way the Linux regulator core would: apply a fixed
++ * voltage from the constraints first. U-Boot only does that itself for
++ * boot-on/always-on regulators, and vcc_lcd (RK817 LDO8) is neither, so
++ * after a power-off it would come up at the PMIC's reset voltage; after a
++ * reboot it just keeps the 3.3 V Linux left.
++ */
++static int st7701_supply_on(struct udevice *dev, struct udevice *supply)
++{
++	struct dm_regulator_uclass_plat *uc = dev_get_uclass_plat(supply);
++	int ret;
++
++	if (uc->min_uV > 0 && uc->min_uV == uc->max_uV) {
++		ret = regulator_set_value(supply, uc->min_uV);
++		if (ret && ret != -ENOSYS) {
++			dev_err(dev, "%s: cannot set %d uV (%d)\n", uc->name,
++				uc->min_uV, ret);
++			return ret;
++		}
++	}
++
++	ret = regulator_set_enable_if_allowed(supply, true);
++	if (ret) {
++		dev_err(dev, "%s: cannot enable (%d)\n", uc->name, ret);
++		return ret;
++	}
++
++	/* No serial port on these boards: leave a trace in the console log */
++	printf("Panel: %s %d uV, %s\n", uc->name, regulator_get_value(supply),
++	       regulator_get_enable(supply) ? "on" : "off");
++
++	return 0;
++}
++
++static int st7701_panel_enable_backlight(struct udevice *dev)
++{
++	struct mipi_dsi_panel_plat *plat = dev_get_plat(dev);
++	struct st7701_panel_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	ret = mipi_dsi_attach(plat->device);
++	if (ret < 0)
++		return ret;
++
++	/* Power and reset, as the Linux driver's prepare() */
++	dm_gpio_set_value(&priv->reset, 0);
++	if (priv->vcc) {
++		ret = st7701_supply_on(dev, priv->vcc);
++		if (ret)
++			return ret;
++	}
++	if (priv->iovcc && priv->iovcc != priv->vcc) {
++		ret = st7701_supply_on(dev, priv->iovcc);
++		if (ret)
++			return ret;
++	}
++	mdelay(120);
++	dm_gpio_set_value(&priv->reset, 1);
++	mdelay(150);
++
++	ret = st7701_go_ultra_init(plat->device);
++	if (ret) {
++		dev_err(dev, "init sequence failed %d\n", ret);
++		return ret;
++	}
++
++	if (priv->backlight) {
++		ret = backlight_enable(priv->backlight);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int st7701_panel_set_backlight(struct udevice *dev, int percent)
++{
++	struct st7701_panel_priv *priv = dev_get_priv(dev);
++
++	if (!priv->backlight)
++		return 0;
++
++	return backlight_set_brightness(priv->backlight, percent);
++}
++
++static int st7701_panel_get_display_timing(struct udevice *dev,
++					   struct display_timing *timings)
++{
++	memcpy(timings, &go_ultra_timing, sizeof(*timings));
++
++	return 0;
++}
++
++static int st7701_panel_of_to_plat(struct udevice *dev)
++{
++	struct st7701_panel_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	if (CONFIG_IS_ENABLED(DM_REGULATOR)) {
++		ret = device_get_supply_regulator(dev, "VCC-supply", &priv->vcc);
++		if (ret && ret != -ENOENT)
++			dev_warn(dev, "cannot get VCC supply (%d)\n", ret);
++		ret = device_get_supply_regulator(dev, "IOVCC-supply",
++						  &priv->iovcc);
++		if (ret && ret != -ENOENT)
++			dev_warn(dev, "cannot get IOVCC supply (%d)\n", ret);
++	}
++
++	ret = uclass_get_device_by_phandle(UCLASS_PANEL_BACKLIGHT, dev,
++					   "backlight", &priv->backlight);
++	if (ret) {
++		dev_warn(dev, "failed to get backlight (%d)\n", ret);
++		priv->backlight = NULL;
++	}
++
++	ret = gpio_request_by_name(dev, "reset-gpios", 0, &priv->reset,
++				   GPIOD_IS_OUT);
++	if (ret && ret != -ENOENT) {
++		dev_err(dev, "cannot get reset GPIO (%d)\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int st7701_panel_probe(struct udevice *dev)
++{
++	struct mipi_dsi_panel_plat *plat = dev_get_plat(dev);
++
++	/* fill characteristics of DSI data link */
++	plat->lanes = 2;
++	plat->format = MIPI_DSI_FMT_RGB888;
++	plat->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
++			   MIPI_DSI_MODE_LPM;
++
++	return 0;
++}
++
++static const struct panel_ops st7701_panel_ops = {
++	.enable_backlight = st7701_panel_enable_backlight,
++	.set_backlight = st7701_panel_set_backlight,
++	.get_display_timing = st7701_panel_get_display_timing,
++};
++
++static const struct udevice_id st7701_panel_ids[] = {
++	{ .compatible = "odroid,go-ultra-panel" },
++	{ }
++};
++
++U_BOOT_DRIVER(st7701_panel) = {
++	.name		= "st7701_panel",
++	.id		= UCLASS_PANEL,
++	.of_match	= st7701_panel_ids,
++	.ops		= &st7701_panel_ops,
++	.of_to_plat	= st7701_panel_of_to_plat,
++	.probe		= st7701_panel_probe,
++	.plat_auto	= sizeof(struct mipi_dsi_panel_plat),
++	.priv_auto	= sizeof(struct st7701_panel_priv),
++};
