@@ -8,7 +8,7 @@ on:
       - 'projects/ROCKNIX/packages/linux/package.mk'
       - 'projects/ROCKNIX/packages/virtual/emulators/package.mk'
     branches:
-      - next
+      - kernel-config-docs-workflows
 
 jobs:
   update-kernel-configs-docs:
